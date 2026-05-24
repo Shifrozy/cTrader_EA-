@@ -14,7 +14,7 @@ namespace cAlgo.Robots
     public class SuperTrendBot : Robot
     {
         // --- SUPERTREND ---
-        [Parameter("ATR Period", Group = "1. SuperTrend", DefaultValue = 10, MinValue = 1)]
+        [Parameter("ATR Period", Group = "1. SuperTrend", DefaultValue = 14, MinValue = 1)]
         public int AtrPeriod { get; set; }
         [Parameter("Multiplier", Group = "1. SuperTrend", DefaultValue = 3.0, MinValue = 0.1, Step = 0.1)]
         public double Multiplier { get; set; }
