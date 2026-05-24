@@ -411,19 +411,31 @@ namespace cAlgo.Robots
             {
                 double eF = _emaF.Result[closedBar], eS = _emaS.Result[closedBar], cl = Bars.ClosePrices[closedBar];
 
-                if (cur == 1 && CheckFilters(closedBar, "BUY", cl, eF, eS))
+                if (cur == 1)
                 {
-                    string m = string.Format("📈 <b>BUY SIGNAL</b>\n{0} @ {1}\nST flipped BULLISH\nMode: {2}",
-                        SymbolName, cl, _isAuto ? "AUTO ✅" : "MANUAL 👤");
-                    Print("📈 BUY @ " + cl); SendAlerts(m, "BUY", closedBar); SendTelegram(m);
-                    if (_isAuto) { ClosePosType(TradeType.Sell); OpenOrder(TradeType.Buy, closedBar); }
+                    // Always close SELL positions when ST flips BULLISH, regardless of EMA filter
+                    if (_isAuto) ClosePosType(TradeType.Sell);
+                    
+                    if (CheckFilters(closedBar, "BUY", cl, eF, eS))
+                    {
+                        string m = string.Format("📈 <b>BUY SIGNAL</b>\n{0} @ {1}\nST flipped BULLISH\nMode: {2}",
+                            SymbolName, cl, _isAuto ? "AUTO ✅" : "MANUAL 👤");
+                        Print("📈 BUY @ " + cl); SendAlerts(m, "BUY", closedBar); SendTelegram(m);
+                        if (_isAuto) OpenOrder(TradeType.Buy, closedBar);
+                    }
                 }
-                else if (cur == -1 && CheckFilters(closedBar, "SELL", cl, eF, eS))
+                else if (cur == -1)
                 {
-                    string m = string.Format("📉 <b>SELL SIGNAL</b>\n{0} @ {1}\nST flipped BEARISH\nMode: {2}",
-                        SymbolName, cl, _isAuto ? "AUTO ✅" : "MANUAL 👤");
-                    Print("📉 SELL @ " + cl); SendAlerts(m, "SELL", closedBar); SendTelegram(m);
-                    if (_isAuto) { ClosePosType(TradeType.Buy); OpenOrder(TradeType.Sell, closedBar); }
+                    // Always close BUY positions when ST flips BEARISH, regardless of EMA filter
+                    if (_isAuto) ClosePosType(TradeType.Buy);
+                    
+                    if (CheckFilters(closedBar, "SELL", cl, eF, eS))
+                    {
+                        string m = string.Format("📉 <b>SELL SIGNAL</b>\n{0} @ {1}\nST flipped BEARISH\nMode: {2}",
+                            SymbolName, cl, _isAuto ? "AUTO ✅" : "MANUAL 👤");
+                        Print("📉 SELL @ " + cl); SendAlerts(m, "SELL", closedBar); SendTelegram(m);
+                        if (_isAuto) OpenOrder(TradeType.Sell, closedBar);
+                    }
                 }
             }
             
