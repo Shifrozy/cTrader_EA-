@@ -1,0 +1,12 @@
+# Sensitive chat logs and personal documents
+messeges.txt
+como esta cargado el la pc.docx
+readme.pdf
+
+# IDE folders
+.vscode/
+
+# Build artifacts and cTrader specific ignores (if any)
+bin/
+obj/
+*.algo
