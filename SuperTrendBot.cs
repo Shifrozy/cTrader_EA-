@@ -56,6 +56,8 @@ namespace cAlgo.Robots
         public bool UseTrailingSL { get; set; }
         [Parameter("Trailing SL Buffer (Pips)", Group = "4. Trading", DefaultValue = 2.0, MinValue = 0.0)]
         public double SLBufferPips { get; set; }
+        [Parameter("Manage Manual Trades", Group = "4. Trading", DefaultValue = true)]
+        public bool ManageManualTrades { get; set; }
         [Parameter("Max Positions", Group = "4. Trading", DefaultValue = 1, MinValue = 1)]
         public int MaxPositions { get; set; }
         [Parameter("Bot Label", Group = "4. Trading", DefaultValue = "STBot")]
@@ -488,9 +490,15 @@ namespace cAlgo.Robots
             _td[i] = _st[i] == _fL[i] ? 1 : -1;
         }
 
+        private Position[] GetManagedPositions()
+        {
+            return Positions.Where(p => p.SymbolName == SymbolName && 
+                (p.Label == BotLabel || (ManageManualTrades && string.IsNullOrEmpty(p.Label)))).ToArray();
+        }
+
         private void OpenOrder(TradeType tt, int i)
         {
-            if (Positions.FindAll(BotLabel, SymbolName).Length >= MaxPositions) return;
+            if (GetManagedPositions().Length >= MaxPositions) return;
             
             double? sl = FixedSL > 0 ? FixedSL : (double?)null;
             double? tp = FixedTP > 0 ? FixedTP : (double?)null;
@@ -524,7 +532,7 @@ namespace cAlgo.Robots
 
         private void ClosePosType(TradeType tt)
         {
-            foreach (var p in Positions.FindAll(BotLabel, SymbolName).Where(x => x.TradeType == tt))
+            foreach (var p in GetManagedPositions().Where(x => x.TradeType == tt))
             {
                 var r = ClosePosition(p);
                 if (r.IsSuccessful)
@@ -542,7 +550,7 @@ namespace cAlgo.Robots
             double svBuy = _st[i] - bufferPrice;
             double svSell = _st[i] + bufferPrice;
 
-            foreach (var p in Positions.FindAll(BotLabel, SymbolName))
+            foreach (var p in GetManagedPositions())
             {
                 if (p.TradeType == TradeType.Buy && t == 1 && (p.StopLoss == null || svBuy > p.StopLoss))
                     p.ModifyStopLossPrice(Math.Round(svBuy, Symbol.Digits));
