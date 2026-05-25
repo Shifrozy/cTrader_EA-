@@ -54,7 +54,7 @@ namespace cAlgo.Robots
         public double FixedTP { get; set; }
         [Parameter("Trailing SL (SuperTrend)", Group = "4. Trading", DefaultValue = true)]
         public bool UseTrailingSL { get; set; }
-        [Parameter("Trailing SL Buffer (Pips)", Group = "4. Trading", DefaultValue = 2.0, MinValue = 0.0)]
+        [Parameter("Trailing SL Buffer (Pips)", Group = "4. Trading", DefaultValue = 5.0, MinValue = 0.0)]
         public double SLBufferPips { get; set; }
         [Parameter("Manage Manual Trades", Group = "4. Trading", DefaultValue = true)]
         public bool ManageManualTrades { get; set; }
@@ -383,7 +383,8 @@ namespace cAlgo.Robots
                 }
             }
             
-            if (UseTrailingSL) TrailSL(currentBar);
+            // TrailSL is intentionally NOT called here on live tick
+            // It only runs on OnBar (closed candle) to prevent wick stop-outs
         }
 
         protected override void OnBar()
@@ -443,6 +444,9 @@ namespace cAlgo.Robots
                 }
             }
             
+            // Trail stop loss ONLY on confirmed closed candle (not on live tick wicks)
+            if (UseTrailingSL) TrailSL(closedBar);
+
             UpdateDisplay();
         }
 
