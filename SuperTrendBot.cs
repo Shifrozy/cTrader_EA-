@@ -34,8 +34,16 @@ namespace cAlgo.Robots
         public bool EnableSlopeFilter { get; set; }
         [Parameter("Slope Lookback", Group = "3. EMA Slope", DefaultValue = 5, MinValue = 1)]
         public int SlopeLookback { get; set; }
-        [Parameter("Min Slope (pips)", Group = "3. EMA Slope", DefaultValue = 1.0, MinValue = 0.0, Step = 0.1)]
+        [Parameter("Min Slope (pips)", Group = "3. EMA Slope", DefaultValue = 0.5, MinValue = 0.0, Step = 0.1)]
         public double MinSlopeAngle { get; set; }
+
+        // --- ATR RANGE FILTER ---
+        [Parameter("Enable ATR Range Filter", Group = "3b. Range Filter", DefaultValue = true)]
+        public bool EnableAtrRangeFilter { get; set; }
+        [Parameter("ATR Range Lookback", Group = "3b. Range Filter", DefaultValue = 20, MinValue = 5)]
+        public int AtrRangeLookback { get; set; }
+        [Parameter("Min ATR Multiplier", Group = "3b. Range Filter", DefaultValue = 0.7, MinValue = 0.1, Step = 0.1)]
+        public double MinAtrMultiplier { get; set; }
 
         // --- TRADING ---
         [Parameter("Trade Mode (1=Auto,2=Manual)", Group = "4. Trading", DefaultValue = 1)]
@@ -423,8 +431,9 @@ namespace cAlgo.Robots
                     
                     if (CheckFilters(closedBar, "BUY", cl, eF, eS))
                     {
-                        string m = string.Format("📈 <b>BUY SIGNAL</b>\n{0} @ {1}\nST flipped BULLISH\nMode: {2}",
-                            SymbolName, cl, _isAuto ? "AUTO ✅" : "MANUAL 👤");
+                        string m = _isAuto
+                            ? string.Format("📈 <b>BUY SIGNAL</b>\n{0} @ {1}\nST flipped BULLISH\nMode: AUTO ✅\nTrade opened automatically", SymbolName, cl)
+                            : string.Format("📈 <b>BUY SIGNAL</b>\n{0} @ {1}\nST flipped BULLISH\n⚡ <b>ACTION REQUIRED: Open BUY now!</b>\nSL: {2:F5}\nTrailing: SuperTrend", SymbolName, cl, _st[closedBar] - SLBufferPips * Symbol.PipSize);
                         Print("📈 BUY @ " + cl); SendAlerts(m, "BUY", closedBar); SendTelegram(m);
                         if (_isAuto) OpenOrder(TradeType.Buy, closedBar);
                     }
@@ -436,8 +445,9 @@ namespace cAlgo.Robots
                     
                     if (CheckFilters(closedBar, "SELL", cl, eF, eS))
                     {
-                        string m = string.Format("📉 <b>SELL SIGNAL</b>\n{0} @ {1}\nST flipped BEARISH\nMode: {2}",
-                            SymbolName, cl, _isAuto ? "AUTO ✅" : "MANUAL 👤");
+                        string m = _isAuto
+                            ? string.Format("📉 <b>SELL SIGNAL</b>\n{0} @ {1}\nST flipped BEARISH\nMode: AUTO ✅\nTrade opened automatically", SymbolName, cl)
+                            : string.Format("📉 <b>SELL SIGNAL</b>\n{0} @ {1}\nST flipped BEARISH\n⚡ <b>ACTION REQUIRED: Open SELL now!</b>\nSL: {2:F5}\nTrailing: SuperTrend", SymbolName, cl, _st[closedBar] + SLBufferPips * Symbol.PipSize);
                         Print("📉 SELL @ " + cl); SendAlerts(m, "SELL", closedBar); SendTelegram(m);
                         if (_isAuto) OpenOrder(TradeType.Sell, closedBar);
                     }
@@ -471,6 +481,15 @@ namespace cAlgo.Robots
                 double sSlope = (_emaS.Result[i] - _emaS.Result[i - SlopeLookback]) / Symbol.PipSize;
                 if (dir == "BUY" && (fSlope < MinSlopeAngle || sSlope < MinSlopeAngle * 0.5)) return false;
                 if (dir == "SELL" && (fSlope > -MinSlopeAngle || sSlope > -MinSlopeAngle * 0.5)) return false;
+            }
+            // ATR Range Filter: Block trades when volatility is too low (choppy/range market)
+            if (EnableAtrRangeFilter && i > AtrRangeLookback)
+            {
+                double currentAtr = _atr.Result[i];
+                double avgAtr = 0;
+                for (int k = i - AtrRangeLookback; k < i; k++) avgAtr += _atr.Result[k];
+                avgAtr /= AtrRangeLookback;
+                if (currentAtr < avgAtr * MinAtrMultiplier) return false;
             }
             return true;
         }
