@@ -54,6 +54,8 @@ namespace cAlgo.Robots
         public double FixedTP { get; set; }
         [Parameter("Trailing SL (SuperTrend)", Group = "4. Trading", DefaultValue = true)]
         public bool UseTrailingSL { get; set; }
+        [Parameter("Trailing SL Buffer (Pips)", Group = "4. Trading", DefaultValue = 2.0, MinValue = 0.0)]
+        public double SLBufferPips { get; set; }
         [Parameter("Max Positions", Group = "4. Trading", DefaultValue = 1, MinValue = 1)]
         public int MaxPositions { get; set; }
         [Parameter("Bot Label", Group = "4. Trading", DefaultValue = "STBot")]
@@ -495,7 +497,9 @@ namespace cAlgo.Robots
             
             if (UseTrailingSL && sl == null)
             {
-                double d = Math.Abs((tt == TradeType.Buy ? Symbol.Ask : Symbol.Bid) - _st[i]) / Symbol.PipSize;
+                double bufferPrice = SLBufferPips * Symbol.PipSize;
+                double adjustedSl = (tt == TradeType.Buy) ? _st[i] - bufferPrice : _st[i] + bufferPrice;
+                double d = Math.Abs((tt == TradeType.Buy ? Symbol.Ask : Symbol.Bid) - adjustedSl) / Symbol.PipSize;
                 if (d > 0) sl = Math.Round(d, 1);
             }
             
@@ -533,13 +537,17 @@ namespace cAlgo.Robots
 
         private void TrailSL(int i)
         {
-            double sv = _st[i]; int t = (int)_td[i];
+            int t = (int)_td[i];
+            double bufferPrice = SLBufferPips * Symbol.PipSize;
+            double svBuy = _st[i] - bufferPrice;
+            double svSell = _st[i] + bufferPrice;
+
             foreach (var p in Positions.FindAll(BotLabel, SymbolName))
             {
-                if (p.TradeType == TradeType.Buy && t == 1 && (p.StopLoss == null || sv > p.StopLoss))
-                    p.ModifyStopLossPrice(sv);
-                else if (p.TradeType == TradeType.Sell && t == -1 && (p.StopLoss == null || sv < p.StopLoss))
-                    p.ModifyStopLossPrice(sv);
+                if (p.TradeType == TradeType.Buy && t == 1 && (p.StopLoss == null || svBuy > p.StopLoss))
+                    p.ModifyStopLossPrice(Math.Round(svBuy, Symbol.Digits));
+                else if (p.TradeType == TradeType.Sell && t == -1 && (p.StopLoss == null || svSell < p.StopLoss))
+                    p.ModifyStopLossPrice(Math.Round(svSell, Symbol.Digits));
             }
         }
 
