@@ -60,6 +60,10 @@ namespace cAlgo.Robots
         public double FixedSL { get; set; }
         [Parameter("Take Profit (Pips, 0=off)", Group = "4. Trading", DefaultValue = 0, MinValue = 0)]
         public double FixedTP { get; set; }
+        [Parameter("Use Risk:Reward TP", Group = "4. Trading", DefaultValue = true)]
+        public bool UseRRTP { get; set; }
+        [Parameter("Risk:Reward Ratio", Group = "4. Trading", DefaultValue = 1.0, MinValue = 0.5, Step = 0.5)]
+        public double RiskRewardRatio { get; set; }
         [Parameter("Trailing SL (SuperTrend)", Group = "4. Trading", DefaultValue = true)]
         public bool UseTrailingSL { get; set; }
         [Parameter("Trailing SL Buffer (Pips)", Group = "4. Trading", DefaultValue = 5.0, MinValue = 0.0)]
@@ -532,6 +536,12 @@ namespace cAlgo.Robots
                 double adjustedSl = (tt == TradeType.Buy) ? _st[i] - bufferPrice : _st[i] + bufferPrice;
                 double d = Math.Abs((tt == TradeType.Buy ? Symbol.Ask : Symbol.Bid) - adjustedSl) / Symbol.PipSize;
                 if (d > 0) sl = Math.Round(d, 1);
+            }
+            
+            // Risk:Reward TP - calculate TP based on SL distance
+            if (UseRRTP && sl != null && sl > 0 && tp == null)
+            {
+                tp = Math.Round(sl.Value * RiskRewardRatio, 1);
             }
             
             double vol = Symbol.QuantityToVolumeInUnits(VolumeLots);
