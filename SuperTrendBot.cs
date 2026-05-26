@@ -64,6 +64,15 @@ namespace cAlgo.Robots
         public bool UseRRTP { get; set; }
         [Parameter("Risk:Reward Ratio", Group = "4. Trading", DefaultValue = 1.0, MinValue = 0.5, Step = 0.5)]
         public double RiskRewardRatio { get; set; }
+        
+        // --- BREAK-EVEN ---
+        [Parameter("Enable Break-Even", Group = "4b. Break Even", DefaultValue = true)]
+        public bool EnableBreakEven { get; set; }
+        [Parameter("Trigger Break-Even (Pips)", Group = "4b. Break Even", DefaultValue = 10.0, MinValue = 1.0)]
+        public double BreakEvenTriggerPips { get; set; }
+        [Parameter("Lock Profit (Pips)", Group = "4b. Break Even", DefaultValue = 2.0, MinValue = 0.0)]
+        public double BreakEvenLockPips { get; set; }
+
         [Parameter("Trailing SL (SuperTrend)", Group = "4. Trading", DefaultValue = true)]
         public bool UseTrailingSL { get; set; }
         [Parameter("Trailing SL Buffer (Pips)", Group = "4. Trading", DefaultValue = 5.0, MinValue = 0.0)]
@@ -395,6 +404,8 @@ namespace cAlgo.Robots
                 }
             }
             
+            if (EnableBreakEven) CheckBreakEven();
+            
             // TrailSL is intentionally NOT called here on live tick
             // It only runs on OnBar (closed candle) to prevent wick stop-outs
         }
@@ -589,6 +600,24 @@ namespace cAlgo.Robots
                     p.ModifyStopLossPrice(Math.Round(svBuy, Symbol.Digits));
                 else if (p.TradeType == TradeType.Sell && t == -1 && (p.StopLoss == null || svSell < p.StopLoss))
                     p.ModifyStopLossPrice(Math.Round(svSell, Symbol.Digits));
+            }
+        }
+
+        private void CheckBreakEven()
+        {
+            foreach (var p in GetManagedPositions())
+            {
+                if (p.Pips >= BreakEvenTriggerPips)
+                {
+                    double newSl = p.TradeType == TradeType.Buy 
+                        ? p.EntryPrice + (BreakEvenLockPips * Symbol.PipSize)
+                        : p.EntryPrice - (BreakEvenLockPips * Symbol.PipSize);
+                        
+                    if (p.TradeType == TradeType.Buy && (p.StopLoss == null || newSl > p.StopLoss))
+                        p.ModifyStopLossPrice(Math.Round(newSl, Symbol.Digits));
+                    else if (p.TradeType == TradeType.Sell && (p.StopLoss == null || newSl < p.StopLoss))
+                        p.ModifyStopLossPrice(Math.Round(newSl, Symbol.Digits));
+                }
             }
         }
 
