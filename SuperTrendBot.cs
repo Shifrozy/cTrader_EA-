@@ -1,7 +1,14 @@
-// SuperTrend Bot v3.0 - With Telegram + Trial System
+// SuperTrend Bot v3.1 - With Telegram + Trial System + Hybrid BE/ST
 // cTrader cBot | SuperTrend + EMA Filter + Telegram Control + 3-Day Trial
+// Changelog v3.1:
+//   - Fixed BreakEven/TrailingSL coordination (SL no longer jumps ahead of SuperTrend)
+//   - Added MaxLots safety cap to prevent unexpectedly large positions
+//   - Improved Telegram reliability (retry, error logging, HTML escaping)
+//   - Optimized chart drawing performance (MaxChartBars parameter)
+//   - NEW: Hybrid BreakEven + SuperTrend trailing mode
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
 using cAlgo.API;
@@ -55,6 +62,8 @@ namespace cAlgo.Robots
         public double VolumeLots { get; set; }
         [Parameter("Risk Amount ($)", Group = "4. Trading", DefaultValue = 10, MinValue = 1)]
         public double RiskAmount { get; set; }
+        [Parameter("Max Lots", Group = "4. Trading", DefaultValue = 1.0, MinValue = 0.01, Step = 0.01)]
+        public double MaxLots { get; set; }
         
         [Parameter("Stop Loss (Pips, 0=off)", Group = "4. Trading", DefaultValue = 0, MinValue = 0)]
         public double FixedSL { get; set; }
@@ -73,6 +82,14 @@ namespace cAlgo.Robots
         [Parameter("Lock Profit (Pips)", Group = "4b. Break Even", DefaultValue = 2.0, MinValue = 0.0)]
         public double BreakEvenLockPips { get; set; }
 
+        // --- HYBRID BREAK-EVEN + SUPERTREND ---
+        [Parameter("Enable Hybrid BE+ST", Group = "4c. Hybrid BE+ST", DefaultValue = false)]
+        public bool EnableHybridBEST { get; set; }
+        [Parameter("Hybrid Trigger (R multiple)", Group = "4c. Hybrid BE+ST", DefaultValue = 0.5, MinValue = 0.1, Step = 0.1)]
+        public double HybridTriggerR { get; set; }
+        [Parameter("Hybrid Lock (R multiple)", Group = "4c. Hybrid BE+ST", DefaultValue = 0.4, MinValue = 0.0, Step = 0.1)]
+        public double HybridLockR { get; set; }
+
         [Parameter("Trailing SL (SuperTrend)", Group = "4. Trading", DefaultValue = true)]
         public bool UseTrailingSL { get; set; }
         [Parameter("Trailing SL Buffer (Pips)", Group = "4. Trading", DefaultValue = 5.0, MinValue = 0.0)]
@@ -83,7 +100,7 @@ namespace cAlgo.Robots
         public int MaxPositions { get; set; }
         [Parameter("Bot Label", Group = "4. Trading", DefaultValue = "STBot")]
         public string BotLabel { get; set; }
-
+ 
         // --- TELEGRAM ---
         [Parameter("Enable Telegram", Group = "5. Telegram", DefaultValue = true)]
         public bool EnableTelegram { get; set; }
@@ -109,6 +126,8 @@ namespace cAlgo.Robots
         public bool ShowST { get; set; }
         [Parameter("Show EMA Lines", Group = "7. Display", DefaultValue = true)]
         public bool ShowEma { get; set; }
+        [Parameter("Max Chart Bars", Group = "7. Display", DefaultValue = 500, MinValue = 50)]
+        public int MaxChartBars { get; set; }
 
         // Trial duration hardcoded (not visible to user)
         private const int TrialDays = 3;
@@ -126,6 +145,14 @@ namespace cAlgo.Robots
         private bool _isPaused = false;
         private bool _touchAlertFired = false;
 
+        // --- Hybrid BE+ST state tracking ---
+        // Tracks the initial SL distance (in price) for each position, keyed by position ID
+        private Dictionary<long, double> _positionInitialRisk = new Dictionary<long, double>();
+        // Tracks which positions have had BreakEven activated
+        private HashSet<long> _breakEvenActivated = new HashSet<long>();
+        // Hybrid state: 0=not triggered, 1=locked at R-level, 2=handed off to SuperTrend
+        private Dictionary<long, int> _hybridState = new Dictionary<long, int>();
+
         protected override void OnStart()
         {
             _httpClient = new HttpClient();
@@ -133,7 +160,7 @@ namespace cAlgo.Robots
             _lastUpdateId = 0;
 
             // --- IMMEDIATE TELEGRAM TEST ---
-            Print("=== BOT STARTING ===");
+            Print("=== BOT STARTING (v3.1) ===");
             Print("TG Check: Enable={0}, TokenLength={1}, ChatIDLength={2}", 
                 EnableTelegram, TelegramToken?.Length ?? 0, TelegramChatId?.Length ?? 0);
 
@@ -198,8 +225,11 @@ namespace cAlgo.Robots
             _isAuto = (TradeModeInput == 1);
 
             for (int i = 0; i < Bars.Count; i++) CalcST(i);
-            if (ShowST) for (int i = AtrPeriod + 1; i < Bars.Count; i++) DrawSTBar(i);
-            if (ShowEma) for (int i = 2; i < Bars.Count; i++) DrawEma(i);
+
+            // Only draw the last MaxChartBars bars on startup to prevent lag
+            int drawStart = Math.Max(AtrPeriod + 1, Bars.Count - MaxChartBars);
+            if (ShowST) for (int i = drawStart; i < Bars.Count; i++) DrawSTBar(i);
+            if (ShowEma) for (int i = Math.Max(2, drawStart); i < Bars.Count; i++) DrawEma(i);
 
             Chart.KeyDown += OnKey;
             UpdateDisplay();
@@ -207,7 +237,7 @@ namespace cAlgo.Robots
             Timer.Start(2);
 
             string startMsg = string.Format(
-                "\ud83e\udd16 SuperTrend Bot v3.0\n" +
+                "\ud83e\udd16 SuperTrend Bot v3.1\n" +
                 "{0} | {1}\n" +
                 "Mode: {2}\n" +
                 "Trial: {3:yyyy-MM-dd HH:mm}\n" +
@@ -255,18 +285,35 @@ namespace cAlgo.Robots
             }
         }
 
-        // --- TELEGRAM SEND ---
+        // --- TELEGRAM SEND (with retry and HTML escaping) ---
         private void SendTelegram(string msg)
         {
             if (!EnableTelegram || string.IsNullOrEmpty(TelegramToken) || string.IsNullOrEmpty(TelegramChatId)) return;
-            try
+            
+            // Escape HTML entities to prevent parse failures
+            string safeMsg = msg.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
+            
+            for (int attempt = 0; attempt < 2; attempt++)
             {
-                string url = string.Format("https://api.telegram.org/bot{0}/sendMessage?chat_id={1}&text={2}&parse_mode=HTML",
-                    TelegramToken, TelegramChatId, Uri.EscapeDataString(msg));
-                var task = _httpClient.GetStringAsync(url);
-                task.Wait(5000); // 5 second timeout
+                try
+                {
+                    string url = string.Format("https://api.telegram.org/bot{0}/sendMessage?chat_id={1}&text={2}&parse_mode=HTML",
+                        TelegramToken, TelegramChatId, Uri.EscapeDataString(safeMsg));
+                    var task = _httpClient.GetStringAsync(url);
+                    task.Wait(5000);
+                    return; // Success, exit
+                }
+                catch (Exception ex)
+                {
+                    Print("TG Send Error (attempt {0}): {1}", attempt + 1, ex.Message);
+                    if (ex.InnerException != null) Print("TG Inner: {0}", ex.InnerException.Message);
+                    if (attempt == 0)
+                    {
+                        // Wait briefly before retry
+                        System.Threading.Thread.Sleep(1000);
+                    }
+                }
             }
-            catch (Exception ex) { Print("TG Send Error: " + ex.Message); }
         }
 
         private void CheckTelegramCommands()
@@ -304,7 +351,11 @@ namespace cAlgo.Robots
                     idx = numEnd;
                 }
             }
-            catch (Exception) { /* Suppress errors for clean logs */ }
+            catch (Exception ex)
+            {
+                // Log instead of silently suppressing
+                Print("TG Commands Error: {0}", ex.Message);
+            }
         }
 
         private void ProcessCommand(string cmd)
@@ -329,7 +380,7 @@ namespace cAlgo.Robots
                 double pnl = pos.Sum(p => p.NetProfit);
                 TimeSpan rem = _trialExpiry - Server.Time;
                 string status = string.Format(
-                    "📊 <b>Status Report</b>\n" +
+                    "📊 Status Report\n" +
                     "Symbol: {0} | TF: {1}\n" +
                     "Mode: {2}\n" +
                     "Open Positions: {3}\n" +
@@ -343,7 +394,7 @@ namespace cAlgo.Robots
             else if (cmd == "/start")
             {
                 _isPaused = false;
-                SendTelegram("✅ Bot Resumed!\n\n🤖 SuperTrend Bot v3.0\nCommands:\n/auto - Automatic trading\n/manual - Manual mode (alerts only)\n/status - Show status\n/stop - Pause bot");
+                SendTelegram("✅ Bot Resumed!\n\n🤖 SuperTrend Bot v3.1\nCommands:\n/auto - Automatic trading\n/manual - Manual mode (alerts only)\n/status - Show status\n/stop - Pause bot");
             }
             else if (cmd == "/stop")
             {
@@ -404,10 +455,11 @@ namespace cAlgo.Robots
                 }
             }
             
-            if (EnableBreakEven) CheckBreakEven();
+            // BreakEven runs on tick for responsiveness, but now coordinated with SuperTrend
+            if (EnableBreakEven && !EnableHybridBEST) CheckBreakEven();
             
-            // TrailSL is intentionally NOT called here on live tick
-            // It only runs on OnBar (closed candle) to prevent wick stop-outs
+            // Hybrid BE+ST also runs on tick for the trigger check
+            if (EnableHybridBEST) CheckHybridBEST();
         }
 
         protected override void OnBar()
@@ -447,8 +499,8 @@ namespace cAlgo.Robots
                     if (CheckFilters(closedBar, "BUY", cl, eF, eS))
                     {
                         string m = _isAuto
-                            ? string.Format("📈 <b>BUY SIGNAL</b>\n{0} @ {1}\nST flipped BULLISH\nMode: AUTO ✅\nTrade opened automatically", SymbolName, cl)
-                            : string.Format("📈 <b>BUY SIGNAL</b>\n{0} @ {1}\nST flipped BULLISH\n⚡ <b>ACTION REQUIRED: Open BUY now!</b>\nSL: {2:F5}\nTrailing: SuperTrend", SymbolName, cl, _st[closedBar] - SLBufferPips * Symbol.PipSize);
+                            ? string.Format("📈 BUY SIGNAL\n{0} @ {1}\nST flipped BULLISH\nMode: AUTO ✅\nTrade opened automatically", SymbolName, cl)
+                            : string.Format("📈 BUY SIGNAL\n{0} @ {1}\nST flipped BULLISH\n⚡ ACTION REQUIRED: Open BUY now!\nSL: {2:F5}\nTrailing: SuperTrend", SymbolName, cl, _st[closedBar] - SLBufferPips * Symbol.PipSize);
                         Print("📈 BUY @ " + cl); SendAlerts(m, "BUY", closedBar); SendTelegram(m);
                         if (_isAuto) OpenOrder(TradeType.Buy, closedBar);
                     }
@@ -461,8 +513,8 @@ namespace cAlgo.Robots
                     if (CheckFilters(closedBar, "SELL", cl, eF, eS))
                     {
                         string m = _isAuto
-                            ? string.Format("📉 <b>SELL SIGNAL</b>\n{0} @ {1}\nST flipped BEARISH\nMode: AUTO ✅\nTrade opened automatically", SymbolName, cl)
-                            : string.Format("📉 <b>SELL SIGNAL</b>\n{0} @ {1}\nST flipped BEARISH\n⚡ <b>ACTION REQUIRED: Open SELL now!</b>\nSL: {2:F5}\nTrailing: SuperTrend", SymbolName, cl, _st[closedBar] + SLBufferPips * Symbol.PipSize);
+                            ? string.Format("📉 SELL SIGNAL\n{0} @ {1}\nST flipped BEARISH\nMode: AUTO ✅\nTrade opened automatically", SymbolName, cl)
+                            : string.Format("📉 SELL SIGNAL\n{0} @ {1}\nST flipped BEARISH\n⚡ ACTION REQUIRED: Open SELL now!\nSL: {2:F5}\nTrailing: SuperTrend", SymbolName, cl, _st[closedBar] + SLBufferPips * Symbol.PipSize);
                         Print("📉 SELL @ " + cl); SendAlerts(m, "SELL", closedBar); SendTelegram(m);
                         if (_isAuto) OpenOrder(TradeType.Sell, closedBar);
                     }
@@ -471,6 +523,9 @@ namespace cAlgo.Robots
             
             // Trail stop loss ONLY on confirmed closed candle (not on live tick wicks)
             if (UseTrailingSL) TrailSL(closedBar);
+
+            // Clean up tracking for closed positions
+            CleanupPositionTracking();
 
             UpdateDisplay();
         }
@@ -549,6 +604,13 @@ namespace cAlgo.Robots
                 if (d > 0) sl = Math.Round(d, 1);
             }
             
+            // Enforce minimum SL distance for safe risk calculation (2 pips minimum)
+            if (sl != null && sl < 2.0)
+            {
+                Print("⚠️ SL distance too small ({0:F1} pips), clamping to 2.0 pips for safety.", sl);
+                sl = 2.0;
+            }
+            
             // Risk:Reward TP - calculate TP based on SL distance
             if (UseRRTP && sl != null && sl > 0 && tp == null)
             {
@@ -566,12 +628,35 @@ namespace cAlgo.Robots
                 }
             }
 
+            // Apply MaxLots safety cap
+            double maxVol = Symbol.QuantityToVolumeInUnits(MaxLots);
+            if (vol > maxVol)
+            {
+                Print("⚠️ Volume clamped from {0} to {1} (MaxLots={2})", vol, maxVol, MaxLots);
+                vol = maxVol;
+            }
+
+            // Ensure minimum volume
+            if (vol < Symbol.VolumeInUnitsMin)
+            {
+                vol = Symbol.VolumeInUnitsMin;
+                Print("⚠️ Volume set to minimum: {0}", vol);
+            }
+
             var r = ExecuteMarketOrder(tt, SymbolName, vol, BotLabel, sl, tp);
             string msg = r.IsSuccessful
-                ? string.Format("✅ {0} opened @ {1} (Vol: {2})", tt, r.Position.EntryPrice, vol)
+                ? string.Format("✅ {0} opened @ {1} (Vol: {2}, SL: {3} pips)", tt, r.Position.EntryPrice, vol, sl ?? 0)
                 : string.Format("❌ {0} failed: {1}", tt, r.Error);
             Print(msg);
-            if (r.IsSuccessful) SendTelegram(msg);
+            if (r.IsSuccessful)
+            {
+                // Track initial risk for this position (used by BreakEven coordination and Hybrid BE+ST)
+                if (sl != null && sl > 0)
+                {
+                    _positionInitialRisk[r.Position.Id] = sl.Value * Symbol.PipSize;
+                }
+                SendTelegram(msg);
+            }
         }
 
         private void ClosePosType(TradeType tt)
@@ -583,6 +668,10 @@ namespace cAlgo.Robots
                 {
                     string msg = string.Format("🔒 Closed {0} #{1} P/L: {2:F2}", tt, p.Id, p.NetProfit);
                     Print(msg); SendTelegram(msg);
+                    // Clean up tracking
+                    _positionInitialRisk.Remove(p.Id);
+                    _breakEvenActivated.Remove(p.Id);
+                    _hybridState.Remove(p.Id);
                 }
             }
         }
@@ -596,6 +685,47 @@ namespace cAlgo.Robots
 
             foreach (var p in GetManagedPositions())
             {
+                // If Hybrid BE+ST is active and position is in "locked" state (state=1),
+                // check if SuperTrend has reached the lock level before allowing trail
+                if (EnableHybridBEST && _hybridState.ContainsKey(p.Id) && _hybridState[p.Id] == 1)
+                {
+                    double lockLevel = GetHybridLockPrice(p);
+                    if (p.TradeType == TradeType.Buy)
+                    {
+                        // SuperTrend (with buffer) must be at or above the lock level to hand off
+                        if (svBuy >= lockLevel)
+                        {
+                            _hybridState[p.Id] = 2; // Hand off to SuperTrend
+                            Print("🔄 Hybrid: Position #{0} handed off to SuperTrend trailing (ST={1:F5} >= Lock={2:F5})", p.Id, svBuy, lockLevel);
+                        }
+                        else
+                        {
+                            continue; // Keep SL frozen at lock level, don't trail
+                        }
+                    }
+                    else // Sell
+                    {
+                        if (svSell <= lockLevel)
+                        {
+                            _hybridState[p.Id] = 2;
+                            Print("🔄 Hybrid: Position #{0} handed off to SuperTrend trailing (ST={1:F5} <= Lock={2:F5})", p.Id, svSell, lockLevel);
+                        }
+                        else
+                        {
+                            continue;
+                        }
+                    }
+                }
+
+                // Standard BreakEven coordination: if BE has fired but we're NOT in hybrid mode,
+                // don't let TrailSL move the stop to a worse level than what BE set
+                if (!EnableHybridBEST && _breakEvenActivated.Contains(p.Id))
+                {
+                    // BreakEven already set the SL. Only trail if SuperTrend is BETTER than current SL.
+                    // The check below (svBuy > p.StopLoss for Buy) already ensures this,
+                    // so BE coordination is inherently handled. No extra logic needed.
+                }
+
                 if (p.TradeType == TradeType.Buy && t == 1 && (p.StopLoss == null || svBuy > p.StopLoss))
                     p.ModifyStopLossPrice(Math.Round(svBuy, Symbol.Digits));
                 else if (p.TradeType == TradeType.Sell && t == -1 && (p.StopLoss == null || svSell < p.StopLoss))
@@ -607,17 +737,141 @@ namespace cAlgo.Robots
         {
             foreach (var p in GetManagedPositions())
             {
+                // Skip if already activated
+                if (_breakEvenActivated.Contains(p.Id)) continue;
+
                 if (p.Pips >= BreakEvenTriggerPips)
                 {
                     double newSl = p.TradeType == TradeType.Buy 
                         ? p.EntryPrice + (BreakEvenLockPips * Symbol.PipSize)
                         : p.EntryPrice - (BreakEvenLockPips * Symbol.PipSize);
+
+                    // COORDINATION FIX: If trailing SL is enabled, check that the BE level
+                    // doesn't jump ahead of where SuperTrend would place the SL.
+                    // Take the MORE CONSERVATIVE (wider) of the two levels.
+                    if (UseTrailingSL && Bars.Count > AtrPeriod + 1)
+                    {
+                        int lastBar = Bars.Count - 2; // Use last closed bar's SuperTrend
+                        int trend = (int)_td[lastBar];
+                        double bufferPrice = SLBufferPips * Symbol.PipSize;
+                        
+                        if (p.TradeType == TradeType.Buy && trend == 1)
+                        {
+                            double stSl = _st[lastBar] - bufferPrice;
+                            // Use the wider (lower for BUY) of BE and ST levels
+                            if (newSl > stSl && stSl > p.EntryPrice)
+                            {
+                                // BE would jump ahead of ST — cap it at ST level
+                                newSl = stSl;
+                                Print("🔧 BE capped at SuperTrend level ({0:F5}) for BUY #{1}", stSl, p.Id);
+                            }
+                        }
+                        else if (p.TradeType == TradeType.Sell && trend == -1)
+                        {
+                            double stSl = _st[lastBar] + bufferPrice;
+                            // Use the wider (higher for SELL) of BE and ST levels
+                            if (newSl < stSl && stSl < p.EntryPrice)
+                            {
+                                newSl = stSl;
+                                Print("🔧 BE capped at SuperTrend level ({0:F5}) for SELL #{1}", stSl, p.Id);
+                            }
+                        }
+                    }
                         
                     if (p.TradeType == TradeType.Buy && (p.StopLoss == null || newSl > p.StopLoss))
+                    {
                         p.ModifyStopLossPrice(Math.Round(newSl, Symbol.Digits));
+                        _breakEvenActivated.Add(p.Id);
+                        Print("🔒 BE activated for BUY #{0}: SL → {1:F5}", p.Id, newSl);
+                    }
                     else if (p.TradeType == TradeType.Sell && (p.StopLoss == null || newSl < p.StopLoss))
+                    {
                         p.ModifyStopLossPrice(Math.Round(newSl, Symbol.Digits));
+                        _breakEvenActivated.Add(p.Id);
+                        Print("🔒 BE activated for SELL #{0}: SL → {1:F5}", p.Id, newSl);
+                    }
                 }
+            }
+        }
+
+        // --- HYBRID BREAK-EVEN + SUPERTREND ---
+        // Logic:
+        // 1. Trade opens with normal SL
+        // 2. When profit reaches HybridTriggerR × initialRisk → move SL to entry ± HybridLockR × initialRisk
+        // 3. Keep SL fixed at that level (state=1)
+        // 4. Wait until SuperTrend reaches the lock level
+        // 5. Once SuperTrend >= lock level → hand off to SuperTrend trailing (state=2)
+        // 6. If SuperTrend never reaches, keep SL fixed
+        private void CheckHybridBEST()
+        {
+            foreach (var p in GetManagedPositions())
+            {
+                // Initialize state if not tracked
+                if (!_hybridState.ContainsKey(p.Id))
+                    _hybridState[p.Id] = 0;
+
+                // Skip if already triggered (state 1 or 2)
+                if (_hybridState[p.Id] != 0) continue;
+
+                // Need initial risk to calculate R multiples
+                if (!_positionInitialRisk.ContainsKey(p.Id)) continue;
+
+                double initialRiskPrice = _positionInitialRisk[p.Id]; // in price units
+                double currentProfitPrice = 0;
+
+                if (p.TradeType == TradeType.Buy)
+                    currentProfitPrice = Symbol.Bid - p.EntryPrice;
+                else
+                    currentProfitPrice = p.EntryPrice - Symbol.Ask;
+
+                // Check if profit has reached the trigger level
+                if (currentProfitPrice >= HybridTriggerR * initialRiskPrice)
+                {
+                    // Calculate lock level
+                    double lockPrice = HybridLockR * initialRiskPrice;
+                    double newSl = p.TradeType == TradeType.Buy
+                        ? p.EntryPrice + lockPrice
+                        : p.EntryPrice - lockPrice;
+
+                    if (p.TradeType == TradeType.Buy && (p.StopLoss == null || newSl > p.StopLoss))
+                    {
+                        p.ModifyStopLossPrice(Math.Round(newSl, Symbol.Digits));
+                        _hybridState[p.Id] = 1; // Locked
+                        Print("🔐 Hybrid BE: BUY #{0} locked at +{1:F1}R (SL={2:F5})", p.Id, HybridLockR, newSl);
+                        SendTelegram(string.Format("🔐 Hybrid BE: BUY #{0} profit reached {1:F1}R - SL locked at +{2:F1}R ({3:F5})", 
+                            p.Id, HybridTriggerR, HybridLockR, newSl));
+                    }
+                    else if (p.TradeType == TradeType.Sell && (p.StopLoss == null || newSl < p.StopLoss))
+                    {
+                        p.ModifyStopLossPrice(Math.Round(newSl, Symbol.Digits));
+                        _hybridState[p.Id] = 1;
+                        Print("🔐 Hybrid BE: SELL #{0} locked at +{1:F1}R (SL={2:F5})", p.Id, HybridLockR, newSl);
+                        SendTelegram(string.Format("🔐 Hybrid BE: SELL #{0} profit reached {1:F1}R - SL locked at +{2:F1}R ({3:F5})",
+                            p.Id, HybridTriggerR, HybridLockR, newSl));
+                    }
+                }
+            }
+        }
+
+        private double GetHybridLockPrice(Position p)
+        {
+            if (!_positionInitialRisk.ContainsKey(p.Id)) return p.StopLoss ?? p.EntryPrice;
+            double lockPrice = HybridLockR * _positionInitialRisk[p.Id];
+            return p.TradeType == TradeType.Buy
+                ? p.EntryPrice + lockPrice
+                : p.EntryPrice - lockPrice;
+        }
+
+        private void CleanupPositionTracking()
+        {
+            // Remove tracking entries for positions that no longer exist
+            var activeIds = new HashSet<long>(GetManagedPositions().Select(p => (long)p.Id));
+            var staleIds = _positionInitialRisk.Keys.Where(id => !activeIds.Contains(id)).ToList();
+            foreach (var id in staleIds)
+            {
+                _positionInitialRisk.Remove(id);
+                _breakEvenActivated.Remove(id);
+                _hybridState.Remove(id);
             }
         }
 
@@ -646,11 +900,11 @@ namespace cAlgo.Robots
             else
                 Chart.DrawIcon("D_" + i, ChartIconType.Circle, i, _st[i], c);
             
-            // Clean up old objects to save memory and prevent freezing
-            if (i > 1500)
+            // Clean up old objects using MaxChartBars threshold
+            if (i > MaxChartBars)
             {
-                Chart.RemoveObject("L_" + (i - 1500));
-                Chart.RemoveObject("D_" + (i - 1500));
+                Chart.RemoveObject("L_" + (i - MaxChartBars));
+                Chart.RemoveObject("D_" + (i - MaxChartBars));
             }
         }
 
@@ -667,11 +921,11 @@ namespace cAlgo.Robots
                 Chart.DrawTrendLine("ES_" + i, i-1, _emaS.Result[i-1], i, _emaS.Result[i], Color.Cyan, 2, LineStyle.Solid);
             }
             
-            // Cleanup
-            if (i > 1500)
+            // Cleanup using MaxChartBars threshold
+            if (i > MaxChartBars)
             {
-                Chart.RemoveObject("EF_" + (i - 1500));
-                Chart.RemoveObject("ES_" + (i - 1500));
+                Chart.RemoveObject("EF_" + (i - MaxChartBars));
+                Chart.RemoveObject("ES_" + (i - MaxChartBars));
             }
         }
 
